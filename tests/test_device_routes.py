@@ -604,6 +604,88 @@ def test_trmnl_display_serves_the_saved_rate(app: Flask) -> None:
         assert body["refresh_rate"] == rate
 
 
+# -- /api/display dynamic refresh_rate (app.device_poll) ----------------
+#
+# The TRMNL BYOS path echoes the same next-poll decision the v1 REST
+# path's next_poll_s uses: configured refresh_rate_s is the ceiling,
+# pulled earlier for a projected dashboard change, stretched to sleep
+# through a quiet window the device asked to sleep through.
+
+
+class _StubEvent:
+    def __init__(self, *, in_seconds: float, certainty: str = "scheduled") -> None:
+        from datetime import UTC, datetime, timedelta
+
+        self.scheduled_at = datetime.now(UTC) + timedelta(seconds=in_seconds)
+        self.certainty = certainty
+
+
+class _StubScheduler:
+    def __init__(self, events=None, *, boom: bool = False) -> None:
+        self._events = events or []
+        self._boom = boom
+
+    def upcoming_for_device(self, device_id: str, **kwargs):
+        if self._boom:
+            raise RuntimeError("projection exploded")
+        return self._events
+
+
+def _trmnl_device(app: Flask, device_id: str, *, refresh_rate_s: int) -> str:
+    client = app.test_client()
+    _sign_in(client)
+    _add_instance(client, id=device_id, kind="trmnl_client")
+    store = app.config["SETTINGS_STORE"]
+    section = store.get_section("devices") or {}
+    entry = dict(section.get(device_id) or {})
+    entry["refresh_rate_s"] = refresh_rate_s
+    store.patch_section("devices", {device_id: entry})
+    return app.config["DEVICE_REGISTRY"].get(device_id).manifest["access_token"]
+
+
+def _display_refresh_rate(app: Flask, token: str) -> int:
+    body = app.test_client().get("/api/display", headers={"Access-Token": token}).get_json()
+    return int(body["refresh_rate"])
+
+
+def test_trmnl_display_refresh_rate_pulls_forward_to_a_projected_change(app: Flask) -> None:
+    token = _trmnl_device(app, "trmnl_proj", refresh_rate_s=900)
+    app.config["SCHEDULER"] = _StubScheduler([_StubEvent(in_seconds=120)])
+    rate = _display_refresh_rate(app, token)
+    assert 185 <= rate <= 190  # 120 + 70 s scheduler margin, minus test latency
+
+
+def test_trmnl_display_refresh_rate_never_exceeds_the_configured_rate(app: Flask) -> None:
+    token = _trmnl_device(app, "trmnl_ceiling", refresh_rate_s=300)
+    app.config["SCHEDULER"] = _StubScheduler([_StubEvent(in_seconds=99999)])
+    assert _display_refresh_rate(app, token) == 300
+
+
+def test_trmnl_display_refresh_rate_sleeps_through_quiet_hours(app: Flask) -> None:
+    token = _trmnl_device(app, "trmnl_quiet", refresh_rate_s=900)
+    from datetime import UTC, datetime, timedelta
+
+    now = datetime.now(UTC).replace(second=0, microsecond=0)
+    app.config["SETTINGS_STORE"].patch_section(
+        "app",
+        {
+            "timezone": "UTC",
+            "quiet_hours_enabled": True,
+            "quiet_hours_start": (now - timedelta(hours=1)).strftime("%H:%M"),
+            "quiet_hours_end": (now + timedelta(hours=2)).strftime("%H:%M"),
+            "quiet_hours_sleep": True,
+        },
+    )
+    rate = _display_refresh_rate(app, token)
+    assert 7200 <= rate <= 7320  # ~2 h to the window's end, + inclusive minute + margin
+
+
+def test_trmnl_display_refresh_rate_falls_back_when_the_projection_raises(app: Flask) -> None:
+    token = _trmnl_device(app, "trmnl_boom", refresh_rate_s=450)
+    app.config["SCHEDULER"] = _StubScheduler(boom=True)
+    assert _display_refresh_rate(app, token) == 450
+
+
 def test_trmnl_api_display_envelope_matches_terminus_shape(app: Flask) -> None:
     """0.44.1: /api/display response shape matches the official
     Terminus BYOS contract. Every field a native TRMNL firmware

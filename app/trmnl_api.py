@@ -43,6 +43,7 @@ from typing import Any
 
 from flask import Blueprint, Flask, Response, current_app, jsonify, request, url_for
 
+from app import device_poll
 from app.device_loader import Device, DeviceRegistry
 from app.discovery import record_trmnl_discovery
 
@@ -392,7 +393,19 @@ def display() -> Response | tuple[Response, int]:
         )
 
     _update_status_from_headers(device)
-    refresh_rate = _refresh_rate_for(device)
+    # ``refresh_rate`` is the next-poll cadence. The configured
+    # ``refresh_rate_s`` is the ceiling; app.device_poll pulls it earlier
+    # for the next projected dashboard change or a widget staleness hint,
+    # reshapes it onto a wake-alignment grid, and stretches it to sleep
+    # through a quiet window the device asked to sleep through. Same
+    # decision the v1 REST path's ``next_poll_s`` uses. A fault anywhere
+    # in that degrades to the static configured value.
+    configured_refresh = _refresh_rate_for(device)
+    try:
+        refresh_rate = device_poll.next_poll_s(device, configured_s=configured_refresh)
+    except Exception:
+        logger.exception("trmnl: dynamic refresh_rate failed for device=%s", device.id)
+        refresh_rate = configured_refresh
     w, h = _requested_panel_dims(device)
 
     # Real render path: PushManager records the most recent successful
@@ -416,6 +429,15 @@ def display() -> Response | tuple[Response, int]:
             _external=True,
         )
         filename = f"placeholder-{device.id}-{w}x{h}.png"
+
+    # TEMPORARY debug line (session diagnostic, not part of the F2 diff):
+    # confirms exactly when a client polls and picks up a given render.
+    logger.info(
+        "trmnl: served /api/display to device=%s filename=%s refresh_rate=%s",
+        device.id,
+        filename,
+        refresh_rate,
+    )
 
     # Envelope shape matches Terminus's official /api/display response
     # so any TRMNL-compatible firmware reads the same fields it would

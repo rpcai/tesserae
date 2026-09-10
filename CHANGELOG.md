@@ -114,6 +114,16 @@ All notable changes to Tesserae are recorded here. Format loosely follows
   Paper Pro, driven by the community tesserae.remarkable AppLoad client over
   the v1 REST device API. The reMarkable 2 is confirmed on hardware; the
   other two are built from the same code paths and await confirmation.
+- Dynamic `refresh_rate` on the TRMNL BYOS `/api/display` path. It echoed the
+  static configured `refresh_rate_s`; now it runs the same next-poll decision
+  the v1 REST path's `next_poll_s` has used since #241 — the configured rate is
+  the ceiling, pulled earlier for the next projected dashboard change or a
+  widget staleness hint, reshaped onto a wake-alignment grid, and stretched to
+  sleep through a quiet window the device asked to sleep through (#299). A Kobo
+  or Kindle running KOReader with "Use server refresh interval" enabled now
+  wakes once at the end of quiet hours instead of every interval overnight. The
+  shared decision moved into `app.device_poll`; a fault anywhere in it degrades
+  to the static configured value.
 - 16-level greyscale over TRMNL BYOS. A new `trmnl_png_gray16` renderer: the
   same fit / flip / underscan / contrast / dither pipeline as `trmnl_png`, but
   quantised to a 16-entry grey ramp and saved as an 8-bit greyscale PNG. For

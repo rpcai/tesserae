@@ -58,11 +58,10 @@ from urllib.parse import urlencode
 from flask import Blueprint, Flask, current_app, jsonify, request
 from werkzeug.wrappers import Response
 
+from app import device_poll
 from app.button_service import ButtonService, TouchStroke
 from app.device_loader import Device, DeviceRegistry
 from app.device_service import (
-    AWAKE_POLL_MIN_S,
-    awake_poll_interval_s,
     create_instance,
     generate_access_token,
     panel_geometry_from_report,
@@ -487,16 +486,6 @@ def _parse_touch_query() -> TouchStroke | None:
     )
 
 
-def _device_awake_poll_s(device: Device) -> int | None:
-    """This device's always-on poll cadence, or None when it deep-sleeps.
-
-    Read live from settings on every heartbeat, so changing the cadence in
-    Settings takes effect on the device's next poll with no reboot."""
-    section = _settings().get_section("devices") or {}
-    stored = section.get(device.id) if isinstance(section, dict) else None
-    return awake_poll_interval_s(stored)
-
-
 def _configured_poll_s(device: Device) -> int:
     """The device's configured wake interval. Reads the stored
     ``sleep_interval_s`` from settings when present (matches the
@@ -517,7 +506,7 @@ def _configured_poll_s(device: Device) -> int:
     feature defeated by a field about something else. The repaint limit
     belongs on the path that decides to send a new frame.
     """
-    awake = _device_awake_poll_s(device)
+    awake = device_poll.device_awake_poll_s(device)
     if awake is not None:
         return awake
     section = _settings().get_section("devices") or {}
@@ -529,111 +518,6 @@ def _configured_poll_s(device: Device) -> int:
     if isinstance(spec, dict) and isinstance(spec.get("default"), int):
         return int(spec["default"])
     return 60
-
-
-# Seconds to add to a widget's declared change before telling the client to
-# poll. The render is a browser compose plus a quantize, so a client polling
-# at exactly that moment races it and collects the *previous* frame. A margin
-# costs nothing (the device is asleep for it) and turns a guaranteed miss
-# into a hit. ``/frame`` also re-renders on demand once a declared change has
-# passed, so this only needs to cover the render itself.
-_CONTENT_POLL_MARGIN_S: int = 20
-
-# Seconds to add to a *scheduler-projected* change. The scheduler does not
-# fire at the projected instant: it wakes every ``tick_seconds`` (30 s, on a
-# phase set by when the process started), fires everything due in ascending
-# priority order, and each fire renders in turn, so a lineup due at 06:00:00
-# lands anywhere up to ~40 s later on a busy tick. A device told to come back
-# at 06:00:20 polled before the frame existed, collected yesterday's, and
-# slept its whole configured interval on it. The margin has to clear a full
-# tick plus the renders that share it.
-_SCHEDULER_TICK_S: int = 30
-_PROJECTED_POLL_MARGIN_S: int = _SCHEDULER_TICK_S + 2 * _CONTENT_POLL_MARGIN_S
-
-# Never ask a client to poll faster than this, however close the next change
-# is. Itself clamped by the configured interval below, so a deliberately
-# hot-polling panel (sleep_interval_s < this) isn't slowed down.
-_MIN_CONTENT_POLL_S: int = 5
-
-# Certainties worth waking for. ``estimated`` events are the engine's own
-# guess at an unanchored cadence, so waking early for one trades a real wake
-# for a maybe; the configured interval is the better answer there.
-_WAKE_WORTHY_CERTAINTIES = frozenset({"scheduled", "conditional"})
-
-
-def _projected_poll_s(device: Device, configured_s: int) -> int | None:
-    """Seconds until the device's next *projected content change*, plus the
-    render margin, or ``None`` when there's nothing to project.
-
-    ``next_poll_s`` is documented to the client as "new content is probably
-    available at" (discussion #190), but historically it only ever echoed the
-    configured interval, which knows nothing about when the dashboard
-    actually changes. The projection engine already answers that question for
-    the Companion API and the scheduler; this reads the same answer onto the
-    device REST path.
-
-    Only ever returns something *sooner* than ``configured_s``; the caller
-    keeps that as the ceiling. Manual Send, webhooks, Home Assistant events
-    and data-change refreshes have no schedule to project, so a device that
-    slept past its configured interval would go blind to all of them.
-    """
-    scheduler = current_app.config.get("SCHEDULER")
-    if scheduler is None:
-        return None
-
-    from datetime import UTC, datetime
-
-    from app.device_upcoming import MAX_HOURS
-    from app.quiet_hours import resolve_quiet_hours
-
-    now = datetime.now(UTC)
-    # Anything past the configured interval gets capped to it anyway, so
-    # there's no point walking the record set further than that.
-    hours = max(1, min(MAX_HOURS, -(-configured_s // 3600)))
-    quiet_window = resolve_quiet_hours(_settings().get_section("app") or {}, device)
-    events = scheduler.upcoming_for_device(
-        device.id,
-        now=now,
-        hours=hours,
-        limit=4,
-        quiet_window=quiet_window,
-    )
-    for event in events:
-        if event.certainty not in _WAKE_WORTHY_CERTAINTIES:
-            continue
-        delta = (event.scheduled_at - now).total_seconds()
-        # A record whose target has passed but which has not fired yet is
-        # projected at "now" (the next tick fires it). It reaches here a
-        # fraction of a second in the past, because ``scheduled_at`` is
-        # truncated to whole seconds, and used to be skipped as stale, so a
-        # device that polled a moment before the tick was told to sleep its
-        # whole interval on the old frame. Anything overdue by less than a
-        # tick is imminent: poll again after the margin.
-        if delta < -_SCHEDULER_TICK_S:
-            continue
-        return max(0, int(delta)) + _PROJECTED_POLL_MARGIN_S
-    return None
-
-
-def _widget_change_poll_s(device: Device) -> int | None:
-    """Seconds until a widget on this device said its own output goes
-    stale, plus the render margin (#243).
-
-    Schedules and rotation steps are what ``project_upcoming`` can see. A
-    meeting ending, a bin going out, a countdown hitting zero are none of
-    those: only the widget knows, and only once it has fetched. The
-    composer records the soonest hint per device on every render.
-    """
-    from app import widget_next_change
-
-    app = current_app._get_current_object()  # type: ignore[attr-defined]
-    ts = widget_next_change.peek(app, device.id)
-    if ts is None:
-        return None
-    delta = ts - time.time()
-    if delta < 0:
-        return None
-    return int(delta) + _CONTENT_POLL_MARGIN_S
 
 
 def _refresh_if_widget_change_elapsed(device: Device, push_mgr: Any) -> None:
@@ -676,184 +560,16 @@ def _refresh_if_widget_change_elapsed(device: Device, push_mgr: Any) -> None:
         widget_next_change.clear(app, device.id)
 
 
-def _wake_alignment_for(device: Device) -> Any:
-    """The device's resolved wake alignment, or ``None`` when off.
-
-    Always-on panels are excluded: they aren't on the sleep grid at all,
-    so aligning their poll cadence would only add jitter to a device
-    that is already continuously reachable."""
-    from app import wake_alignment
-
-    if _device_awake_poll_s(device) is not None:
-        return None
-    section = _settings().get_section("devices") or {}
-    stored = section.get(device.id) if isinstance(section, dict) else None
-    return wake_alignment.alignment_from_stored(stored)
-
-
-def _aligned_wake_epoch(device: Device, alignment: Any, configured: int) -> float | None:
-    """Epoch of the next aligned wake for ``device``, or ``None``.
-
-    The lead comes from telemetry's measured wake-to-checkin EWMA so the
-    paint (not the radio) lands on the grid; zero until the first
-    aligned cycle has been observed. Quiet hours resolve the same way
-    the projection path resolves them, so grid points inside the window
-    are skipped rather than waking a panel automation won't repaint."""
-    from app import wake_alignment
-    from app.quiet_hours import resolve_quiet_hours
-    from app.tz_resolve import app_timezone
-
-    lead = 0
-    telemetry = current_app.config.get("DEVICE_TELEMETRY")
-    if telemetry is not None:
-        try:
-            entry = telemetry.get(device.id)
-            if entry is not None and entry.wake_lead_ewma_s is not None:
-                lead = round(entry.wake_lead_ewma_s)
-        except Exception:
-            lead = 0
-    quiet = resolve_quiet_hours(_settings().get_section("app") or {}, device)
-    return wake_alignment.next_aligned_wake_epoch(
-        alignment,
-        now=time.time(),
-        tz=app_timezone(),
-        interval_s=configured,
-        quiet=quiet,
-        lead_s=lead,
-    )
-
-
-# Sleep-through quiet hours (#299): wake this long after the window opens
-# so the first poll lands on the far side of it even if the clocks
-# disagree by a few seconds, and never ask for more than this in one go
-# (the firmware's own ceiling is seven days).
-_QUIET_SLEEP_MARGIN_S = 30
-_QUIET_SLEEP_MAX_S = 6 * 24 * 3600
-
-
-def _quiet_sleep_through_s(device: Device) -> int | None:
-    """Seconds until this device's quiet window opens, when it is inside
-    the window now and its effective quiet-hours layer asked it to sleep
-    through. ``None`` otherwise, and for always-on panels: those never
-    sleep, so the saving does not exist and holding their polls would
-    only delay a manual push."""
-    if _device_awake_poll_s(device) is not None:
-        return None
-    from datetime import UTC, datetime
-
-    from app.quiet_hours import quiet_ends_at, resolve_quiet_hours
-    from app.tz_resolve import app_timezone
-
-    window = resolve_quiet_hours(_settings().get_section("app") or {}, device)
-    if window is None or not window.sleep_through:
-        return None
-    now = datetime.now(UTC)
-    ends = quiet_ends_at(window, now, app_timezone())
-    if ends is None or ends <= now:
-        return None
-    return min(int((ends - now).total_seconds()) + _QUIET_SLEEP_MARGIN_S, _QUIET_SLEEP_MAX_S)
-
-
 def _next_poll_decision(device: Device) -> tuple[int, int | None]:
-    """:func:`_next_poll_decision_inner` with the sleep-through quiet
-    hours stretch applied on top (#299). A device inside a quiet window it
-    asked to sleep through gets the later of its normal wake and the
-    window's end; the absolute instant goes out with it so capable
-    firmware sleeps to the wall clock over a multi-day hold rather than
-    accumulating timer drift. Any fault in the quiet math falls back to
-    the normal decision rather than stranding the device."""
-    result, wake_at = _next_poll_decision_inner(device)
-    try:
-        through = _quiet_sleep_through_s(device)
-    except Exception:
-        logger.exception("rest: quiet-hours sleep-through failed for device=%s", device.id)
-        through = None
-    if through is not None and through > result:
-        return through, int(time.time()) + through
-    return result, wake_at
+    """Seconds until the firmware should poll again, plus the absolute
+    wake instant (epoch) when one was issued.
 
-
-def _next_poll_decision_inner(device: Device) -> tuple[int, int | None]:
-    """How many seconds until the firmware should poll again, plus the
-    absolute wake instant (epoch) when wake alignment issued it.
-
-    The configured wake interval is the ceiling: it's the staleness the
-    operator signed up for, and it's the only thing covering the update
-    causes that can't be projected. Within that, the soonest known change
-    pulls the wake earlier so the client lands on the new frame instead of
-    on an arbitrary point of a fixed grid.
-
-    Two sources feed it: the scheduler's projection of schedules and
-    rotation steps, and a widget's own declaration of when its data turns
-    over (#243). Either can be absent; a fault in one must not lose the
-    other, so they're gathered independently.
-
-    Wake alignment reshapes the ceiling. In ``interval`` mode the
-    ceiling becomes "seconds to the next wall-clock grid point" (always
-    at most the configured interval), and the projected-content pulls
-    still apply — a scheduled push is deliberate content, waking early
-    for it is correct. In ``times`` mode the device wakes *only* at the
-    listed times; that's the operator asking for exact wake moments, so
-    nothing pulls it earlier. Any fault in the alignment math falls back
-    to today's relative behaviour rather than stranding the device.
-
-    The second element of the return is ``None`` unless alignment is
-    active; when set it is the same instant as the first element, as an
-    absolute epoch, so capable firmware can sleep to a wall-clock target
-    instead of a relative timer and shed the awake-time slip."""
-    from app import wake_alignment
-
-    now = time.time()
-    configured = _configured_poll_s(device)
-    aligned_epoch: float | None = None
-    alignment = None
-    try:
-        alignment = _wake_alignment_for(device)
-        if alignment is not None:
-            aligned_epoch = _aligned_wake_epoch(device, alignment, configured)
-    except Exception:
-        logger.exception("rest: wake alignment failed for device=%s", device.id)
-        alignment, aligned_epoch = None, None
-
-    if alignment is not None and aligned_epoch is not None:
-        aligned_delta = max(1, round(aligned_epoch - now))
-        if alignment.mode == wake_alignment.MODE_TIMES:
-            return aligned_delta, int(now) + aligned_delta
-        configured = aligned_delta
-
-    def _wake_at(result: int) -> int | None:
-        if aligned_epoch is None:
-            return None
-        return int(now) + result
-
-    candidates: list[int] = []
-    try:
-        projected = _projected_poll_s(device, configured)
-    except Exception:
-        logger.exception("rest: next_poll_s projection failed for device=%s", device.id)
-        projected = None
-    if projected is not None:
-        candidates.append(projected)
-    try:
-        declared = _widget_change_poll_s(device)
-    except Exception:
-        logger.exception("rest: next_poll_s widget hint failed for device=%s", device.id)
-        declared = None
-    if declared is not None:
-        candidates.append(declared)
-    if not candidates:
-        return configured, _wake_at(configured)
-    # Ceiling: the configured interval. Floor: _MIN_CONTENT_POLL_S, itself
-    # capped by the configured interval so a hot-polling panel keeps its
-    # cadence.
-    #
-    # An always-on panel floors at the awake minimum instead. The content
-    # floor exists to stop a sleeping device spinning its radio up for a
-    # change it could have waited for; a device that never sleeps is already
-    # associated, so the cost of an early poll is one conditional GET.
-    floor = AWAKE_POLL_MIN_S if _device_awake_poll_s(device) is not None else _MIN_CONTENT_POLL_S
-    result = max(min(min(candidates), configured), min(configured, floor))
-    return result, _wake_at(result)
+    The whole decision — configured ceiling, projected-content and
+    widget-declared pulls, wake alignment, sleep-through quiet hours —
+    lives in :mod:`app.device_poll` so this path and the TRMNL BYOS
+    ``/api/display`` path stay in lockstep. The v1 REST ceiling is the
+    device's ``sleep_interval_s`` resolution."""
+    return device_poll.next_poll_decision(device, configured_s=_configured_poll_s(device))
 
 
 def _next_poll_s(device: Device) -> int:
